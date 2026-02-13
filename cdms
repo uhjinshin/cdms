@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+
+# Codex Machine Sync (cdms)
+# Safely sync ~/.codex/ directory between machines
+# Forked from ccms (MIT License)
+
+set -euo pipefail
+
+# ==========================================
+# [Configuration] Codex 타겟 설정
+# ==========================================
+APP_NAME="Codex"
+LOCAL_DIR="$HOME/.codex"
+CONFIG_DIR="$HOME/.cdms"
+
+# System File Paths
+CONFIG_FILE="$CONFIG_DIR/config"
+EXCLUDE_FILE="$CONFIG_DIR/exclude"
+BACKUP_DIR="$CONFIG_DIR/backups"
+LOCK_FILE="$CONFIG_DIR/sync.lock"
+CHECKSUM_FILE="$CONFIG_DIR/checksums"
+REMOTE_CHECKSUM_FILE="$CONFIG_DIR/remote_checksums"
+VERSION="1.1.0"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Initialize directories & Default Excludes
+init_dirs() {
+    mkdir -p "$CONFIG_DIR" "$BACKUP_DIR"
+    
+    # [안전장치] 기본 제외 목록 자동 생성
+    if [[ ! -f "$EXCLUDE_FILE" ]]; then
+        # echo -e "${BLUE}[INFO]${NC} Creating default exclude file..."
+        cat > "$EXCLUDE_FILE" << EOF
+.DS_Store
+*.log
+*.lock
+*.sock
+tmp/
+auth.json
+*.db-wal
+*.db-shm
+EOF
+    fi
+}
+
+# Helpers
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+
+# Lock Management
+check_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        print_error "Another sync operation is in progress (lock file exists)"
+        print_info "If no sync is running, remove: $LOCK_FILE"
+        exit 1
+    fi
+}
+create_lock() { echo $$ > "$LOCK_FILE"; }
+remove_lock() { rm -f "$LOCK_FILE"; }
+trap remove_lock EXIT
+
+# Checksums
+generate_checksums() {
+    local target_dir="$1"
+    local output_file="$2"
+    
+    if [[ ! -d "$target_dir" ]]; then
+        print_error "Directory not found: $target_dir"
+        return 1
+    fi
+    
+    print_info "Generating checksums for $target_dir"
+    local temp_file
+    temp_file=$(mktemp)
+    
+    if [[ -f "$EXCLUDE_FILE" && -s "$EXCLUDE_FILE" ]]; then
+        local rsync_cmd="rsync -avz --dry-run --list-only"
+        rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"
+        
+        eval "$rsync_cmd '$target_dir/' /tmp/dummy-target/" 2>/dev/null | \
+        grep -E '^-' | awk '{print $5}' | while read -r file; do
+            if [[ -f "$target_dir/$file" ]]; then
+                sha256sum "$target_dir/$file" >> "$temp_file" 2>/dev/null || true
+            fi
+        done
+    else
+        find "$target_dir" -type f -exec sha256sum {} \; 2>/dev/null > "$temp_file" || true
+    fi
+    
+    sed "s|$target_dir/||g" "$temp_file" | sort > "$output_file"
+    rm -f "$temp_file"
+    
+    local file_count
+    file_count=$(wc -l < "$output_file")
+    print_success "Generated checksums for $file_count files"
+}
+
+verify_checksums() {
+    local target_dir="$1"
+    local checksum_file="$2"
+    local description="$3"
+    
+    if [[ ! -f "$checksum_file" ]]; then return 0; fi
+    if [[ ! -s "$checksum_file" ]]; then return 0; fi
+    
+    print_info "Verifying $description checksums..."
+    local failed=0
+    local total=0
+    local missing=0
+    
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then continue; fi
+        
+        local expected_hash
+        local file_path
+        expected_hash=$(echo "$line" | awk '{print $1}')
+        file_path=$(echo "$line" | cut -d' ' -f3-)
+        total=$((total + 1))
+        local full_path="$target_dir/$file_path"
+        
+        if [[ ! -f "$full_path" ]]; then
+            print_warning "Missing file: $file_path"
+            missing=$((missing + 1))
+            continue
+        fi
+        
+        local actual_hash
+        actual_hash=$(sha256sum "$full_path" 2>/dev/null | awk '{print $1}')
+        
+        if [[ "$expected_hash" != "$actual_hash" ]]; then
+            print_error "Checksum mismatch: $file_path"
+            failed=$((failed + 1))
+        fi
+    done < "$checksum_file"
+    
+    if [[ $failed -gt 0 || $missing -gt 0 ]]; then
+        print_error "Verification failed: $failed corrupted, $missing missing"
+        return 1
+    else
+        print_success "All $total files verified successfully"
+        return 0
+    fi
+}
+
+download_remote_checksums() {
+    load_config
+    local remote_target="$REMOTE_PATH"
+    if [[ "$REMOTE_PATH" != /* && "$REMOTE_PATH" != \~* ]]; then
+         remote_target="~/$REMOTE_PATH"
+    fi
+    
+    scp "$REMOTE_HOST:$remote_target/.cdms-checksums" "$REMOTE_CHECKSUM_FILE" 2>/dev/null || {
+        print_warning "No remote checksums found (normal for first run)"
+        return 0
+    }
+}
+
+upload_checksums() {
+    load_config
+    if [[ ! -f "$CHECKSUM_FILE" ]]; then return 0; fi
+    
+    local remote_target="$REMOTE_PATH"
+    if [[ "$REMOTE_PATH" != /* && "$REMOTE_PATH" != \~* ]]; then
+         remote_target="~/$REMOTE_PATH"
+    fi
+
+    scp "$CHECKSUM_FILE" "$REMOTE_HOST:$remote_target/.cdms-checksums" || {
+        print_error "Failed to upload checksums"
+        return 1
+    }
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        print_error "Run 'cdms config' first"
+        exit 1
+    fi
+    source "$CONFIG_FILE"
+}
+
+config_cdms() {
+    print_info "Codex Machine Sync Configuration"
+    echo
+    if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
+    
+    read -p "Remote host (SSH alias) [${REMOTE_HOST:-}]: " new_host
+    REMOTE_HOST="${new_host:-${REMOTE_HOST:-}}"
+    
+    read -p "Remote path [${REMOTE_PATH:-.codex}]: " new_path
+    REMOTE_PATH="${new_path:-${REMOTE_PATH:-.codex}}"
+    
+    read -p "Rsync options [${RSYNC_OPTS:--avz --delete}]: " new_opts
+    RSYNC_OPTS="${new_opts:-${RSYNC_OPTS:--avz --delete}}"
+    
+    cat > "$CONFIG_FILE" << EOF
+REMOTE_HOST="$REMOTE_HOST"
+REMOTE_PATH="$REMOTE_PATH"
+RSYNC_OPTS="$RSYNC_OPTS"
+EOF
+    
+    print_success "Configuration saved"
+    print_info "Testing SSH..."
+    if ssh "$REMOTE_HOST" "test -d '$REMOTE_PATH' || mkdir -p '$REMOTE_PATH' && echo 'Connection successful'"; then
+        print_success "SSH test passed"
+    else
+        print_error "SSH failed"
+        exit 1
+    fi
+}
+
+create_backup() {
+    local backup_name="codex-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    local backup_path="$BACKUP_DIR/$backup_name"
+    
+    print_info "Creating backup: $backup_name"
+    tar -czf "$backup_path" -C "$HOME" .codex 2>/dev/null || {
+        print_error "Backup failed"
+        return 1
+    }
+    ls -t "$BACKUP_DIR"/codex-backup-*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm -f
+    print_success "Backup created"
+    return 0
+}
+
+push_to_remote() {
+    load_config
+    check_lock
+    create_lock
+    
+    local remote_target="$REMOTE_HOST:$REMOTE_PATH/"
+    if [[ "$REMOTE_PATH" != /* && "$REMOTE_PATH" != \~* ]]; then
+         remote_target="$REMOTE_HOST:~/$REMOTE_PATH/"
+    fi
+
+    print_info "Pushing $LOCAL_DIR to $remote_target"
+    generate_checksums "$LOCAL_DIR" "$CHECKSUM_FILE" || exit 1
+    
+    local rsync_cmd="rsync $RSYNC_OPTS"
+    if [[ -f "$EXCLUDE_FILE" ]]; then rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"; fi
+    
+    if [[ "${FORCE:-}" != "true" ]]; then
+        print_info "Dry run..."
+        eval "$rsync_cmd --dry-run '$LOCAL_DIR/' '$remote_target'" || exit 1
+        read -p "Proceed? [y/N] " -n 1 -r; echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
+    fi
+    
+    eval "$rsync_cmd '$LOCAL_DIR/' '$remote_target'" || exit 1
+    upload_checksums
+    print_success "Push complete"
+}
+
+pull_from_remote() {
+    load_config
+    check_lock
+    create_lock
+    
+    local remote_source="$REMOTE_HOST:$REMOTE_PATH/"
+    if [[ "$REMOTE_PATH" != /* && "$REMOTE_PATH" != \~* ]]; then
+         remote_source="$REMOTE_HOST:~/$REMOTE_PATH/"
+    fi
+
+    print_info "Pulling from $remote_source"
+    download_remote_checksums
+    if [[ "${NO_BACKUP:-}" != "true" ]]; then create_backup || exit 1; fi
+    
+    local rsync_cmd="rsync $RSYNC_OPTS"
+    if [[ -f "$EXCLUDE_FILE" ]]; then rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"; fi
+    
+    if [[ "${FORCE:-}" != "true" ]]; then
+        print_info "Dry run..."
+        eval "$rsync_cmd --dry-run '$remote_source' '$LOCAL_DIR/'" || exit 1
+        read -p "Proceed? [y/N] " -n 1 -r; echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
+    fi
+    
+    eval "$rsync_cmd '$remote_source' '$LOCAL_DIR/'" || exit 1
+    
+    if [[ -f "$REMOTE_CHECKSUM_FILE" ]]; then
+        verify_checksums "$LOCAL_DIR" "$REMOTE_CHECKSUM_FILE" "post-pull" || {
+            print_error "Verification failed! Restoring from backup is recommended."
+            exit 1
+        }
+    fi
+    print_success "Pull complete"
+}
+
+show_status() {
+    load_config
+    local remote_target="$REMOTE_HOST:$REMOTE_PATH/"
+    if [[ "$REMOTE_PATH" != /* && "$REMOTE_PATH" != \~* ]]; then
+         remote_target="$REMOTE_HOST:~/$REMOTE_PATH/"
+    fi
+
+    local rsync_cmd="rsync $RSYNC_OPTS --dry-run -i"
+    if [[ -f "$EXCLUDE_FILE" ]]; then rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"; fi
+    
+    echo; print_info "Local → Remote changes:"
+    eval "$rsync_cmd '$LOCAL_DIR/' '$remote_target'" | grep -v "^\.d" || echo "  No changes"
+    
+    echo; print_info "Remote → Local changes:"
+    eval "$rsync_cmd '$remote_target' '$LOCAL_DIR/'" | grep -v "^\.d" || echo "  No changes"
+}
+
+verify_files() {
+    if [[ ! -f "$CHECKSUM_FILE" ]]; then
+        generate_checksums "$LOCAL_DIR" "$CHECKSUM_FILE"
+        exit 0
+    fi
+    verify_checksums "$LOCAL_DIR" "$CHECKSUM_FILE" "local"
+}
+
+show_help() {
+    echo "Codex Machine Sync (cdms) v$VERSION"
+    echo "Usage: cdms [options] [command]"
+    echo "Commands: push, pull, status, verify, config, backup"
+    echo "Options: -f/--force, -n/--no-backup"
+}
+
+main() {
+    init_dirs
+    
+    COMMAND=""
+    FORCE=false
+    NO_BACKUP=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--force) FORCE=true; shift ;;
+            -n|--no-backup) NO_BACKUP=true; shift ;;
+            push|pull|status|verify|config|backup|help)
+                COMMAND=$1
+                shift
+                ;;
+            -h|--help) COMMAND="help"; shift ;;
+            *) print_error "Unknown argument: $1"; show_help; exit 1 ;;
+        esac
+    done
+    
+    case $COMMAND in
+        push) push_to_remote ;;
+        pull) pull_from_remote ;;
+        status) show_status ;;
+        verify) verify_files ;;
+        config) config_cdms ;;
+        backup) create_backup ;;
+        help|"") show_help ;;
+    esac
+}
+
+main "$@"

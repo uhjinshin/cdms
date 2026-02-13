@@ -1,62 +1,111 @@
-# CDMS - Codex Machine Sync
+# CDMS (Codex Machine Sync)
 
-**CDMS** is a lightweight tool to synchronize your OpenAI Codex CLI environment (`~/.codex`) across multiple machines (e.g., MacBook ↔ Mac Mini).
+**CDMS** is a lightweight, safe synchronization tool for OpenAI Codex CLI (`~/.codex`) across multiple machines (e.g., MacBook ↔ Mac Mini).
 
-It is a fork of [ccms](https://github.com/miwidot/ccms) adapted for Codex.
+It is a fork of [ccms](https://github.com/miwidot/ccms), specialized for the Codex environment with optimized safety rules.
 
-## Features
+## 🚀 Features
 
-- 🧠 **Syncs Codex Brain**: Keeps sessions, settings, and context in sync.
-- 🛡️ **Safety First**: Automatically excludes sensitive `auth.json` and crash-prone SQLite temp files (`.db-wal`).
-- 🔄 **Bidirectional**: Push to server / Pull from server.
-- 📦 **Backups**: Auto-backups local state before pulling.
+- **Brain Sync**: Synchronizes your Codex sessions, context, and settings.
+- **Safety First**: Automatically excludes sensitive files (`auth.json`) and crash-prone SQLite temporary files (`.db-wal`, `.db-shm`).
+- **Bidirectional**: Supports both `push` (upload) and `pull` (download).
+- **Auto-Backup**: Automatically creates a local backup before pulling to prevent data loss.
+- **Integrity Check**: Verifies file integrity using SHA256 checksums.
 
-## Installation
+## 📦 Installation
+
+### Option 1: Using the Install Script (Recommended)
+
+Run the following commands in your terminal:
 
 ```bash
-# Clone this repository
-git clone [https://github.com/YOUR_USERNAME/cdms.git](https://github.com/YOUR_USERNAME/cdms.git)
+# 1. Clone the repository
+git clone https://github.com/uhjinshin/cdms.git
 cd cdms
 
-# Run installer
+# 2. Run the installer
 chmod +x install.sh
 ./install.sh
 ```
 
-Quick Start
-Configure:
+### Option 2: Manual Installation
 
-Bash
+If you prefer to install manually:
+
+```bash
+chmod +x cdms
+sudo cp cdms /usr/local/bin/
+```
+
+## ⚙️ Configuration
+
+Before using CDMS, you need to configure your remote server (e.g., your Mac Mini).
+
+```bash
 cdms config
-Remote Host: Your SSH alias (e.g., mac-mini)
+```
 
-Remote Path: Press Enter (defaults to .codex)
+You will be asked for:
+1.  **Remote Host**: Your SSH alias or IP address (e.g., `mac-mini` or `192.168.0.x`).
+2.  **Remote Path**: Press **Enter** to use the default (`.codex`).
+3.  **Rsync Options**: Press **Enter** to use defaults (`-avz --delete`).
 
-Sync:
+## 🛠 Usage
 
-Bash
-cdms push   # Upload from current machine
-cdms pull   # Download to current machine
-Safety Note
-Close Codex before syncing to ensure database integrity.
+### Basic Commands
 
-Auth Tokens: auth.json is excluded by default for security. You must log in on each machine once.
+| Command | Description |
+|---------|-------------|
+| `cdms push` | Upload local changes to the remote machine |
+| `cdms pull` | Download remote changes to the local machine |
+| `cdms status` | Show differences between local and remote |
+| `cdms verify` | Verify file integrity |
+| `cdms backup` | Create a manual backup of `~/.codex` |
 
+### Typical Workflow (Laptop ↔ Desktop)
 
----
+1.  **Start working (on Laptop):**
+    ```bash
+    cdms pull
+    ```
+2.  **Finish working:**
+    ```bash
+    cdms push
+    ```
+3.  **Switch to Desktop:**
+    ```bash
+    cdms pull
+    ```
 
-### 📝 5단계: 라이선스 (`LICENSE`)
+## ⚠️ Important Safety Notes
 
-오픈소스 매너를 지키기 위해 원작자(miwidot)의 MIT 라이선스[cite: 80]를 유지하되, 님의 이름도 추가할 수 있습니다.
+### 1. Close Codex Before Syncing
+To prevent SQLite database corruption, **always close the Codex terminal/process before running `push` or `pull`.**
 
-`nano LICENSE` 입력 후 붙여넣기:
+### 2. Auth Tokens are NOT Synced
+For security reasons, `auth.json` is excluded by default. You must log in to Codex on each machine individually.
+
+### 3. Excluded Files
+The following files are excluded to ensure stability:
+- `.DS_Store`
+- `*.log`, `*.lock`, `*.sock`
+- `tmp/` directory
+- `*.db-wal`, `*.db-shm` (SQLite temporary files)
+
+## 📂 File Structure
+
+CDMS stores its configuration and backups in `~/.cdms/`:
 
 ```text
-MIT License
-
-Copyright (c) 2025 Uh-Jin Shin
-Copyright (c) 2025 miwidot (Original CCMS)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy...
-(이하 MIT 라이선스 전문은 인터넷에서 복사하거나 ccms의 것 그대로 사용)
+~/.cdms/
+├── config              # Server connection settings
+├── exclude             # Rsync exclude patterns
+├── backups/            # Auto-generated backups (keeps last 5)
+├── sync.lock           # Prevents concurrent operations
+└── checksums           # File integrity data
 ```
+
+## License
+
+This project is licensed under the MIT License.
+Based on [ccms](https://github.com/miwidot/ccms) by miwidot.

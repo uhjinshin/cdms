@@ -45,6 +45,9 @@ tmp/
 auth.json
 *.db-wal
 *.db-shm
+.cdms-checksums
+checksums
+stats-cache.json
 EOF
     fi
 }

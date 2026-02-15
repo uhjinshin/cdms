@@ -51,7 +51,6 @@ stats-cache.json
 EOF
     fi
 }
-
 # Helpers
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
@@ -288,10 +287,17 @@ pull_from_remote() {
     eval "$rsync_cmd '$remote_source' '$LOCAL_DIR/'" || exit 1
     
     if [[ -f "$REMOTE_CHECKSUM_FILE" ]]; then
-        verify_checksums "$LOCAL_DIR" "$REMOTE_CHECKSUM_FILE" "post-pull" || {
-            print_error "Verification failed! Restoring from backup is recommended."
-            exit 1
-        }
+        if ! verify_checksums "$LOCAL_DIR" "$REMOTE_CHECKSUM_FILE" "post-pull"; then
+            print_warning "Mismatch detected. If you worked on the Remote machine, this is normal."
+            read -p "Update local ledger to match these remote changes? [y/N] " -n 1 -r; echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                generate_checksums "$LOCAL_DIR" "$CHECKSUM_FILE"
+                print_success "Local ledger updated."
+            else
+                print_error "Sync aborted to protect data integrity."
+                exit 1
+            fi
+        fi
     fi
     print_success "Pull complete"
 }

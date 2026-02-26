@@ -48,6 +48,8 @@ auth.json
 .cdms-checksums
 checksums
 stats-cache.json
+models_cache.json
+shell_snapshots/
 EOF
     fi
 }

@@ -16,11 +16,12 @@ CONFIG_DIR="$HOME/.cdms"
 # System File Paths
 CONFIG_FILE="$CONFIG_DIR/config"
 EXCLUDE_FILE="$CONFIG_DIR/exclude"
+PATHMAP_FILE="$CONFIG_DIR/pathmap"
 BACKUP_DIR="$CONFIG_DIR/backups"
 LOCK_FILE="$CONFIG_DIR/sync.lock"
 CHECKSUM_FILE="$CONFIG_DIR/checksums"
 REMOTE_CHECKSUM_FILE="$CONFIG_DIR/remote_checksums"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Colors
 RED='\033[0;31m'
@@ -50,6 +51,21 @@ checksums
 stats-cache.json
 models_cache.json
 shell_snapshots/
+EOF
+    fi
+
+    # Optional machine-specific path normalization rules.
+    # Format: from_prefix=to_prefix
+    # Example: /Volumes/External/Desktop=$HOME/Desktop
+    if [[ ! -f "$PATHMAP_FILE" ]]; then
+        cat > "$PATHMAP_FILE" << EOF
+# Optional path normalization rules applied to sync staging copies only.
+# Format:
+# from_prefix=to_prefix
+#
+# Examples:
+# /Volumes/ExternalSSD/Desktop=\$HOME/Desktop
+# /Volumes/ExternalSSD/Projects=\$HOME/Projects
 EOF
     fi
 }
@@ -169,17 +185,73 @@ download_remote_checksums() {
 
 upload_checksums() {
     load_config
-    if [[ ! -f "$CHECKSUM_FILE" ]]; then return 0; fi
+    local checksum_file="${1:-$CHECKSUM_FILE}"
+    if [[ ! -f "$checksum_file" ]]; then return 0; fi
     
     local remote_target="$REMOTE_PATH"
     if [[ "$REMOTE_PATH" != /* && "$REMOTE_PATH" != \~* ]]; then
          remote_target="~/$REMOTE_PATH"
     fi
 
-    scp "$CHECKSUM_FILE" "$REMOTE_HOST:$remote_target/.cdms-checksums" || {
+    scp "$checksum_file" "$REMOTE_HOST:$remote_target/.cdms-checksums" || {
         print_error "Failed to upload checksums"
         return 1
     }
+}
+
+expand_pathmap_value() {
+    local value="$1"
+    if [[ "$value" == "~"* ]]; then
+        value="${HOME}${value:1}"
+    fi
+    value="${value//\$\{HOME\}/$HOME}"
+    value="${value//\$HOME/$HOME}"
+    printf '%s' "$value"
+}
+
+apply_pathmap_to_staging() {
+    local staging_dir="$1"
+    [[ -f "$PATHMAP_FILE" && -s "$PATHMAP_FILE" ]] || return 0
+
+    local line from_prefix to_prefix from_expanded to_expanded
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" != *"="* ]]; then
+            print_warning "Ignoring invalid pathmap entry: $line"
+            continue
+        fi
+
+        from_prefix="${line%%=*}"
+        to_prefix="${line#*=}"
+        from_expanded="$(expand_pathmap_value "$from_prefix")"
+        to_expanded="$(expand_pathmap_value "$to_prefix")"
+
+        [[ -z "$from_expanded" ]] && continue
+        if [[ "$from_expanded" == "$to_expanded" ]]; then
+            continue
+        fi
+
+        print_info "Applying pathmap: $from_expanded -> $to_expanded"
+        find "$staging_dir" \
+            \( -name '*.jsonl' -o -name '*.json' -o -name '*.toml' \) \
+            -type f -print0 |
+            while IFS= read -r -d '' file; do
+                CDMS_FROM="$from_expanded" CDMS_TO="$to_expanded" \
+                    perl -0pi -e 's/\Q$ENV{CDMS_FROM}\E/$ENV{CDMS_TO}/g' "$file"
+            done
+    done < "$PATHMAP_FILE"
+}
+
+copy_to_staging() {
+    local source_dir="$1"
+    local staging_dir
+    staging_dir=$(mktemp -d)
+
+    local rsync_cmd="rsync -a"
+    if [[ -f "$EXCLUDE_FILE" ]]; then rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"; fi
+    eval "$rsync_cmd '$source_dir/' '$staging_dir/'"
+    apply_pathmap_to_staging "$staging_dir" >&2
+    printf '%s' "$staging_dir"
 }
 
 load_config() {
@@ -246,19 +318,38 @@ push_to_remote() {
 
     print_info "Pushing $LOCAL_DIR to $remote_target"
     generate_checksums "$LOCAL_DIR" "$CHECKSUM_FILE" || exit 1
+
+    local staging_dir
+    staging_dir="$(copy_to_staging "$LOCAL_DIR")"
+    local remote_checksum_file
+    remote_checksum_file=$(mktemp)
+    generate_checksums "$staging_dir" "$remote_checksum_file" || {
+        rm -rf "$staging_dir" "$remote_checksum_file"
+        exit 1
+    }
     
     local rsync_cmd="rsync $RSYNC_OPTS"
     if [[ -f "$EXCLUDE_FILE" ]]; then rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"; fi
     
     if [[ "${FORCE:-}" != "true" ]]; then
         print_info "Dry run..."
-        eval "$rsync_cmd --dry-run '$LOCAL_DIR/' '$remote_target'" || exit 1
+        eval "$rsync_cmd --dry-run '$staging_dir/' '$remote_target'" || {
+            rm -rf "$staging_dir" "$remote_checksum_file"
+            exit 1
+        }
         read -p "Proceed? [y/N] " -n 1 -r; echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            rm -rf "$staging_dir" "$remote_checksum_file"
+            exit 0
+        fi
     fi
     
-    eval "$rsync_cmd '$LOCAL_DIR/' '$remote_target'" || exit 1
-    upload_checksums
+    eval "$rsync_cmd '$staging_dir/' '$remote_target'" || {
+        rm -rf "$staging_dir" "$remote_checksum_file"
+        exit 1
+    }
+    upload_checksums "$remote_checksum_file"
+    rm -rf "$staging_dir" "$remote_checksum_file"
     print_success "Push complete"
 }
 
@@ -278,29 +369,50 @@ pull_from_remote() {
     
     local rsync_cmd="rsync $RSYNC_OPTS"
     if [[ -f "$EXCLUDE_FILE" ]]; then rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"; fi
+
+    local staging_dir
+    staging_dir=$(mktemp -d)
     
     if [[ "${FORCE:-}" != "true" ]]; then
         print_info "Dry run..."
-        eval "$rsync_cmd --dry-run '$remote_source' '$LOCAL_DIR/'" || exit 1
+        eval "$rsync_cmd --dry-run '$remote_source' '$staging_dir/'" || {
+            rm -rf "$staging_dir"
+            exit 1
+        }
         read -p "Proceed? [y/N] " -n 1 -r; echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            rm -rf "$staging_dir"
+            exit 0
+        fi
     fi
     
-    eval "$rsync_cmd '$remote_source' '$LOCAL_DIR/'" || exit 1
+    eval "$rsync_cmd '$remote_source' '$staging_dir/'" || {
+        rm -rf "$staging_dir"
+        exit 1
+    }
     
     if [[ -f "$REMOTE_CHECKSUM_FILE" ]]; then
-        if ! verify_checksums "$LOCAL_DIR" "$REMOTE_CHECKSUM_FILE" "post-pull"; then
+        if ! verify_checksums "$staging_dir" "$REMOTE_CHECKSUM_FILE" "downloaded remote"; then
             print_warning "Mismatch detected. If you worked on the Remote machine, this is normal."
             read -p "Update local ledger to match these remote changes? [y/N] " -n 1 -r; echo
             if [[ $REPLY =~ ^[Yy]$ ]]; then
-                generate_checksums "$LOCAL_DIR" "$CHECKSUM_FILE"
+                generate_checksums "$staging_dir" "$CHECKSUM_FILE"
                 print_success "Local ledger updated."
             else
+                rm -rf "$staging_dir"
                 print_error "Sync aborted to protect data integrity."
                 exit 1
             fi
         fi
     fi
+
+    apply_pathmap_to_staging "$staging_dir"
+    eval "$rsync_cmd '$staging_dir/' '$LOCAL_DIR/'" || {
+        rm -rf "$staging_dir"
+        exit 1
+    }
+    generate_checksums "$LOCAL_DIR" "$CHECKSUM_FILE"
+    rm -rf "$staging_dir"
     print_success "Pull complete"
 }
 

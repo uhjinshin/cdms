@@ -11,6 +11,8 @@ It is a fork of [ccms](https://github.com/miwidot/ccms), specialized for the Cod
 - **Bidirectional**: Supports both `push` (upload) and `pull` (download).
 - **Auto-Backup**: Automatically creates a local backup before pulling to prevent data loss.
 - **Integrity Check**: Verifies file integrity using SHA256 checksums.
+- **Path Mapping**: Optionally normalizes machine-specific absolute paths in
+  Codex session/config files during sync, using a user-defined pathmap.
 
 ## 📦 Installation
 
@@ -92,6 +94,35 @@ The following files are excluded to ensure stability:
 - `tmp/` directory
 - `*.db-wal`, `*.db-shm` (SQLite temporary files)
 
+### 4. Optional Path Mapping
+
+Codex session files can contain absolute working directories. If one machine
+stores projects under a physical path that does not exist on another machine
+for example because `~/Desktop` is a symlink to an external volume, add explicit
+prefix mappings in:
+
+```text
+~/.cdms/pathmap
+```
+
+Format:
+
+```text
+from_prefix=to_prefix
+```
+
+Example:
+
+```text
+/Volumes/UJ_Solidigm/Desktop=$HOME/Desktop
+/Volumes/UJ_Solidigm/Projects=$HOME/Projects
+```
+
+Path mappings are applied only to temporary staging copies during `push` and
+`pull`. CDMS does not rewrite your original `~/.codex` files in place before
+syncing. This keeps the feature scoped and avoids hard-coding any particular
+repository name.
+
 ## 📂 File Structure
 
 CDMS stores its configuration and backups in `~/.cdms/`:
@@ -100,6 +131,7 @@ CDMS stores its configuration and backups in `~/.cdms/`:
 ~/.cdms/
 ├── config              # Server connection settings
 ├── exclude             # Rsync exclude patterns
+├── pathmap             # Optional absolute path normalization rules
 ├── backups/            # Auto-generated backups (keeps last 5)
 ├── sync.lock           # Prevents concurrent operations
 └── checksums           # File integrity data
